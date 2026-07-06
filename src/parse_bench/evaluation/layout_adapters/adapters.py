@@ -32,7 +32,6 @@ from parse_bench.schemas.layout_detection_output import (
     LayoutTableContent,
     LayoutTextContent,
 )
-from parse_bench.schemas.layout_ontology import CanonicalLabel
 from parse_bench.schemas.parse_output import ParseOutput
 from parse_bench.schemas.pipeline_io import InferenceResult
 from parse_bench.test_cases.schema import TestCase
@@ -204,34 +203,9 @@ class LlamaParseLayoutAdapter(LayoutAdapter):
         return _build_llamaparse_granular_pages_from_payload(grounded_pages)
 
 
-def _warp_table_html(header: list[str] | None, rows: list[list[str]]) -> str:
-    from html import escape
-
-    parts = ["<table>"]
-    if header:
-        cells = "".join(f"<th>{escape(str(cell))}</th>" for cell in header)
-        parts.append(f"<tr>{cells}</tr>")
-    for row in rows:
-        cells = "".join(f"<td>{escape(str(cell))}</td>" for cell in row)
-        parts.append(f"<tr>{cells}</tr>")
-    parts.append("</table>")
-    return "\n".join(parts)
-
-
-def _warp_union_box(boxes: list[list[float]]) -> list[float] | None:
-    rects = [box for box in boxes if box]
-    if not rects:
-        return None
-    x1 = min(box[0] for box in rects)
-    y1 = min(box[1] for box in rects)
-    x2 = max(box[0] + box[2] for box in rects)
-    y2 = max(box[1] + box[3] for box in rects)
-    return [x1, y1, x2, y2]
-
-
 @register_layout_adapter("warp_ingest", priority=100)
 class WarpIngestLayoutAdapter(LayoutAdapter):
-    """Adapter for Warp-Ingest parse outputs with block geometry."""
+    """Adapter for generic layout predictions emitted by Warp-Ingest."""
 
     def to_layout_output(
         self,
@@ -239,105 +213,53 @@ class WarpIngestLayoutAdapter(LayoutAdapter):
         *,
         page_filter: int | None = None,
     ) -> LayoutOutput:
-        raw = inference_result.raw_output if isinstance(inference_result.raw_output, dict) else {}
-        page_dim = raw.get("page_dim") or [612.0, 792.0]
-        image_width = max(1, int(round(float(page_dim[0]))))
-        image_height = max(1, int(round(float(page_dim[1]))))
-        blocks = raw.get("blocks", []) or []
+        try:
+            from warp_ingest.ingestor.markdown_exporter import render_layout_predictions
+        except ImportError as exc:
+            raise ValueError("warp-ingest>=1.0.2 is required for Warp-Ingest layout evaluation") from exc
 
-        predictions: list[LayoutPrediction] = []
-        order = 0
-
-        table_idx: Any = None
-        table_boxes: list[list[float]] = []
-        table_header: list[str] | None = None
-        table_rows: list[list[str]] = []
-        table_page = 1
-
-        def flush_table() -> None:
-            nonlocal order, table_idx, table_boxes, table_header, table_rows
-            if not (table_rows or table_header):
-                table_idx = None
-                return
-            box = _warp_union_box(table_boxes)
-            if box is not None:
-                header = table_header
-                body = [row for row in table_rows if not (header and row == header)]
-                predictions.append(
-                    LayoutPrediction(
-                        bbox=box,
-                        score=1.0,
-                        label=CanonicalLabel.TABLE.value,
-                        page=table_page,
-                        content=LayoutTableContent(html=_warp_table_html(header, body)),
-                        provider_metadata={"order_index": order},
-                    )
-                )
-                order += 1
-            table_idx = None
-            table_boxes = []
-            table_header = None
-            table_rows = []
-
-        label_map = {
-            "header": CanonicalLabel.SECTION_HEADER.value,
-            "para": CanonicalLabel.TEXT.value,
-            "list_item": CanonicalLabel.LIST_ITEM.value,
-            "table_row": CanonicalLabel.TABLE.value,
-        }
-
-        for block in blocks:
-            page = int(block.get("page_idx", 0) or 0) + 1
-            block_type = block.get("block_type")
-            box = block.get("box")
-            text = (block.get("block_text") or "").strip()
-
-            if block_type == "table_row":
-                current_table_idx = block.get("table_idx")
-                if (table_rows or table_header) and current_table_idx != table_idx:
-                    flush_table()
-                table_idx = current_table_idx
-                table_page = page
-                if box:
-                    table_boxes.append(box)
-                header = block.get("header_cell_values")
-                if table_header is None and header:
-                    table_header = [str(cell) for cell in header]
-                cells = block.get("cell_values") or ([text] if text else [])
-                table_rows.append([str(cell) for cell in cells])
-                continue
-
-            if table_rows or table_header:
-                flush_table()
-
-            if not text or box is None:
-                continue
-            xyxy = [box[0], box[1], box[0] + box[2], box[1] + box[3]]
-            predictions.append(
-                LayoutPrediction(
-                    bbox=xyxy,
-                    score=1.0,
-                    label=label_map.get(block_type, CanonicalLabel.TEXT.value),
-                    page=page,
-                    content=LayoutTextContent(text=text),
-                    provider_metadata={"order_index": order},
-                )
-            )
-            order += 1
-
-        if table_rows or table_header:
-            flush_table()
-
-        if page_filter is not None:
-            predictions = [prediction for prediction in predictions if prediction.page == page_filter]
+        payload = inference_result.raw_output if isinstance(inference_result.raw_output, dict) else {}
+        rendered = render_layout_predictions(payload, page_filter=page_filter)
+        predictions = [
+            self._build_prediction(prediction)
+            for prediction in rendered.get("predictions", [])
+            if isinstance(prediction, dict)
+        ]
 
         return LayoutOutput(
             example_id=inference_result.request.example_id,
             pipeline_name=inference_result.pipeline_name,
             model=LayoutDetectionModel.UNSTRUCTURED_LAYOUT,
-            image_width=image_width,
-            image_height=image_height,
+            image_width=self._positive_int(rendered.get("image_width"), 612),
+            image_height=self._positive_int(rendered.get("image_height"), 792),
             predictions=predictions,
+        )
+
+    @staticmethod
+    def _positive_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+        return max(1, parsed)
+
+    @staticmethod
+    def _build_prediction(prediction: dict[str, Any]) -> LayoutPrediction:
+        content_payload = prediction.get("content")
+        content: LayoutTextContent | LayoutTableContent | None = None
+        if isinstance(content_payload, dict) and content_payload.get("type") == "table":
+            content = LayoutTableContent(html=str(content_payload.get("html") or ""))
+        elif isinstance(content_payload, dict):
+            content = LayoutTextContent(text=str(content_payload.get("text") or ""))
+
+        provider_metadata = {"order_index": prediction.get("order_index")}
+        return LayoutPrediction(
+            bbox=[float(value) for value in prediction.get("bbox", [])],
+            score=float(prediction.get("score", 1.0)),
+            label=str(prediction.get("label", "")),
+            page=prediction.get("page"),
+            content=content,
+            provider_metadata=provider_metadata,
         )
 
 

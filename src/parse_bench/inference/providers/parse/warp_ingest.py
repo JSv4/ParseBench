@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import contextlib
-import gc
-import io
-from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
-from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -26,371 +22,42 @@ from parse_bench.schemas.pipeline_io import (
 )
 from parse_bench.schemas.product import ProductType
 
-_PARSE_OPTIONS = {
+_DEFAULT_PARSE_OPTIONS: dict[str, Any] = {
     "apply_ocr": False,
     "render_format": "all",
 }
 
-_KEPT_FIELDS = (
-    "page_idx",
-    "block_type",
-    "block_class",
-    "block_text",
-    "level",
-    "table_idx",
-    "cell_values",
-    "header_cell_values",
-    "bold_ratio",
-    "bold_mask",
-    "italic_ratio",
-    "italic_mask",
-)
+ParsePayloadFn = Callable[..., dict[str, Any]]
+RenderPagesFn = Callable[[dict[str, Any]], list[tuple[int, str]]]
 
 
-def _box_xywh(box_style: Any) -> list[float] | None:
-    if box_style is None:
-        return None
+def _load_markdown_exporter() -> tuple[ParsePayloadFn, RenderPagesFn]:
     try:
-        left = float(getattr(box_style, "left", box_style[1]))
-        top = float(getattr(box_style, "top", box_style[0]))
-        width = float(getattr(box_style, "width", box_style[3]))
-        height = float(getattr(box_style, "height", box_style[4]))
-    except (TypeError, IndexError, ValueError):
-        return None
-    return [left, top, width, height]
-
-
-def _table_regions(blocks: list[dict[str, Any]]) -> dict[int, list[tuple[float, float, float, float]]]:
-    regions: dict[int, list[tuple[float, float, float, float]]] = {}
-    cur: tuple[int, Any, float, float, float, float] | None = None
-
-    def flush() -> None:
-        nonlocal cur
-        if cur:
-            regions.setdefault(cur[0], []).append(cur[2:])
-        cur = None
-
-    for block in blocks:
-        if block.get("block_type") != "table_row" or block.get("table_idx") is None:
-            continue
-        box = block.get("box")
-        if not box:
-            continue
-        page = int(block.get("page_idx", 0) or 0)
-        table_idx = block.get("table_idx")
-        x0, top, x1, bottom = box[0], box[1], box[0] + box[2], box[1] + box[3]
-        if cur and cur[0] == page and cur[1] == table_idx:
-            cur = (
-                page,
-                table_idx,
-                min(cur[2], x0),
-                min(cur[3], top),
-                max(cur[4], x1),
-                max(cur[5], bottom),
-            )
-        else:
-            flush()
-            cur = (page, table_idx, x0, top, x1, bottom)
-    flush()
-    return regions
-
-
-def _normalize_ext_tables(ext: dict[Any, Any]) -> dict[int, list[list[Any]]]:
-    out: dict[int, list[list[Any]]] = {}
-    for key, items in ext.items():
-        norm: list[list[Any]] = []
-        for item in items:
-            if isinstance(item, str):
-                norm.append([None, item])
-            elif isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], str):
-                if isinstance(item[0], (list, tuple)) and len(item[0]) == 4:
-                    norm.append([[float(v) for v in item[0]], item[1]])
-                elif item[0] is None:
-                    norm.append([None, item[1]])
-        if norm:
-            out[int(key)] = norm
-    return out
-
-
-def _extract_warp_blocks(pdf_path: str | Path) -> dict[str, Any]:
-    from warp_ingest.ingestor.pdf_ingestor import PDFIngestor
-
-    sink = io.StringIO()
-    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-        ingestor = PDFIngestor(str(pdf_path), dict(_PARSE_OPTIONS))
-
-    blocks: list[dict[str, Any]] = []
-    for block in ingestor.blocks:
-        kept = {key: block.get(key) for key in _KEPT_FIELDS}
-        kept["box"] = _box_xywh(block.get("box_style"))
-        blocks.append(kept)
-
-    page_indexes = [block.get("page_idx", 0) or 0 for block in blocks]
-    num_pages = (max(page_indexes) + 1) if page_indexes else 0
-    page_dim = ingestor.return_dict.get("page_dim") or [612.0, 792.0]
-
-    out: dict[str, Any] = {
-        "num_pages": num_pages,
-        "page_dim": list(page_dim),
-        "blocks": blocks,
-    }
-
-    try:
-        from warp_ingest.ingestor.table_engine import extract_pdf_tables
-
-        regions = _table_regions(blocks)
-        del ingestor
-        gc.collect()
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            out["ext_tables"] = _normalize_ext_tables(extract_pdf_tables(str(pdf_path), regions_by_page=regions))
-    except Exception:
-        pass
-
-    return out
-
-
-def _heading_prefix(level: Any, level_rank: dict[Any, int] | None = None) -> str:
-    if level_rank and level in level_rank:
-        return "#" * level_rank[level]
-    try:
-        lvl = int(level)
-    except (TypeError, ValueError):
-        lvl = 1
-    return "#" * max(1, min(6, lvl))
-
-
-def _bold_decorate(text: str, block: dict[str, Any]) -> str:
-    if not text:
-        return text
-    words = text.split()
-    n = len(words)
-    bmask = block.get("bold_mask")
-    imask = block.get("italic_mask")
-    bold_ok = bool(bmask) and len(bmask) == n
-    ital_ok = bool(imask) and len(imask) == n
-    if not bold_ok and not ital_ok:
-        ratio = block.get("bold_ratio")
-        if ratio is not None and ratio >= 0.9:
-            return f"**{text}**"
-        return text
-
-    bflags = [bold_ok and bmask[i] == "1" for i in range(n)]
-    iflags = [ital_ok and imask[i] == "1" for i in range(n)]
-    out: list[str] = []
-    i = 0
-    while i < n:
-        bold, italic = bflags[i], iflags[i]
-        j = i
-        while j < n and bflags[j] == bold and iflags[j] == italic:
-            j += 1
-        run = " ".join(words[i:j])
-        if bold and italic:
-            out.append(f"***{run}***")
-        elif bold:
-            out.append(f"**{run}**")
-        elif italic:
-            out.append(f"*{run}*")
-        else:
-            out.append(run)
-        i = j
-    return " ".join(out)
-
-
-def _table_html(header: list[str] | None, rows: list[list[str]]) -> str:
-    parts = ["<table>"]
-    if header:
-        cells = "".join(f"<th>{escape(str(cell))}</th>" for cell in header)
-        parts.append(f"<tr>{cells}</tr>")
-    for row in rows:
-        cells = "".join(f"<td>{escape(str(cell))}</td>" for cell in row)
-        parts.append(f"<tr>{cells}</tr>")
-    parts.append("</table>")
-    return "\n".join(parts)
-
-
-def _bbox_overlap_frac(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
-    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
-    if ix1 <= ix0 or iy1 <= iy0:
-        return 0.0
-    area_a = max(1e-6, (a[2] - a[0]) * (a[3] - a[1]))
-    return (ix1 - ix0) * (iy1 - iy0) / area_a
-
-
-def _emit_nontable(out: list[str], block: dict[str, Any], level_rank: dict[Any, int] | None) -> None:
-    text = (block.get("block_text") or "").strip()
-    if not text:
-        return
-    block_type = block.get("block_type")
-    if block_type == "header":
-        out.append(f"{_heading_prefix(block.get('level'), level_rank)} {text}")
-    elif block_type == "list_item":
-        out.append(f"- {_bold_decorate(text, block)}")
-    else:
-        out.append(_bold_decorate(text, block))
-
-
-def _next_table_row(blocks: list[dict[str, Any]], start: int, table_idx: Any) -> dict[str, Any] | None:
-    for idx in range(start, len(blocks)):
-        next_block = blocks[idx]
-        if next_block.get("block_type") == "table_row":
-            if next_block.get("table_idx") != table_idx:
-                return None
-            return next_block
-        if next_block.get("table_idx") != table_idx:
-            return None
-    return None
-
-
-def _render_block_stream(
-    blocks: list[dict[str, Any]],
-    level_rank: dict[Any, int] | None = None,
-    ext_tables: list[list[Any]] | None = None,
-) -> str:
-    ext_pairs = None
-    if ext_tables:
-        if any(pair[0] is None for pair in ext_tables):
-            return "\n\n".join([pair[1] for pair in ext_tables])
-        ext_pairs = list(ext_tables)
-
-    covered_by: list[int | None] = [None] * len(blocks)
-    if ext_pairs:
-        for idx, block in enumerate(blocks):
-            box = block.get("box")
-            if not box:
-                continue
-            block_bbox = (box[0], box[1], box[0] + box[2], box[1] + box[3])
-            in_table = block.get("block_type") == "table_row" or block.get("table_idx") is not None
-            threshold = 0.5 if in_table else 0.7
-            for table_idx, (table_bbox, _html) in enumerate(ext_pairs):
-                if _bbox_overlap_frac(block_bbox, tuple(table_bbox)) >= threshold:
-                    covered_by[idx] = table_idx
-                    break
-
-    ext_emitted: set[int] = set()
-    span_class_counts: dict[Any, Counter[Any]] = {}
-    for block in blocks:
-        if block.get("block_type") == "table_row" and block.get("table_idx") is not None:
-            span_class_counts.setdefault(block.get("table_idx"), Counter())[block.get("block_class")] += 1
-    dominant_class = {table_idx: counts.most_common(1)[0][0] for table_idx, counts in span_class_counts.items()}
-
-    out: list[str] = []
-    cur_table_idx: Any = None
-    cur_header: list[str] | None = None
-    cur_rows: list[list[str]] = []
-    have_table = False
-
-    def flush_table() -> None:
-        nonlocal cur_table_idx, cur_header, cur_rows, have_table
-        if have_table:
-            header = [str(cell) for cell in cur_header] if cur_header else None
-            body = [row for row in cur_rows if not (header and row == header)]
-            out.append(_table_html(header, body))
-        cur_table_idx = None
-        cur_header = None
-        cur_rows = []
-        have_table = False
-
-    for idx, block in enumerate(blocks):
-        block_type = block.get("block_type")
-        text = (block.get("block_text") or "").strip()
-        table_idx = block.get("table_idx")
-
-        coverage = covered_by[idx]
-        if coverage is not None:
-            if have_table:
-                flush_table()
-            if coverage not in ext_emitted:
-                out.append(ext_pairs[coverage][1])
-                ext_emitted.add(coverage)
-            continue
-
-        if block_type == "table_row":
-            cells = [str(cell) for cell in (block.get("cell_values") or ([text] if text else []))]
-            repeat_header = bool(have_table and cur_header and cur_rows and cells == cur_header)
-            if have_table and (table_idx != cur_table_idx or repeat_header):
-                flush_table()
-            cur_table_idx = table_idx
-            header = block.get("header_cell_values")
-            if cur_header is None and header:
-                cur_header = [str(cell) for cell in header]
-            cur_rows.append(cells)
-            have_table = True
-            continue
-
-        dominant = dominant_class.get(cur_table_idx)
-        next_row = _next_table_row(blocks, idx + 1, cur_table_idx)
-        next_cells = [str(cell) for cell in (next_row.get("cell_values") or [])] if next_row else None
-        class_ok = block.get("block_class") == dominant and (
-            next_row is None or next_row.get("block_class") == dominant
+        from warp_ingest.ingestor.markdown_exporter import (
+            parse_to_markdown_payload,
+            render_pages,
         )
-        keep_open = have_table and text and table_idx is not None and table_idx == cur_table_idx and class_ok
-        if keep_open:
-            if cur_header and next_cells is not None and next_cells == cur_header:
-                flush_table()
-                _emit_nontable(out, block, level_rank)
-            else:
-                cells = block.get("cell_values") or [text]
-                cur_rows.append([str(cell) for cell in cells])
-            continue
+    except ImportError as exc:
+        raise ProviderConfigError(
+            "warp-ingest>=1.0.2 not installed. Run: pip install 'warp-ingest>=1.0.2'"
+        ) from exc
 
-        if have_table:
-            flush_table()
-        _emit_nontable(out, block, level_rank)
-
-    if cur_rows or cur_header:
-        flush_table()
-
-    if ext_pairs:
-        for idx, (_table_bbox, html) in enumerate(ext_pairs):
-            if idx not in ext_emitted:
-                out.append(html)
-
-    return "\n\n".join(out)
-
-
-def _render_pages(raw: dict[str, Any]) -> list[tuple[int, str]]:
-    num_pages = int(raw.get("num_pages", 0) or 0)
-    blocks = raw.get("blocks", []) or []
-
-    by_page: dict[int, list[dict[str, Any]]] = {}
-    for block in blocks:
-        by_page.setdefault(int(block.get("page_idx", 0) or 0), []).append(block)
-
-    header_levels = sorted(
-        {
-            block.get("level")
-            for block in blocks
-            if block.get("block_type") == "header" and block.get("level") is not None
-        }
-    )
-    level_rank = {level: min(6, idx + 1) for idx, level in enumerate(header_levels)}
-
-    ext_tables = _normalize_ext_tables(raw.get("ext_tables") or {})
-    bounds = [num_pages - 1] + list(by_page.keys()) + [int(key) for key in ext_tables]
-    last = max(bounds) if (num_pages or by_page or ext_tables) else -1
-
-    pages: list[tuple[int, str]] = []
-    for page_index in range(0, last + 1):
-        pages.append(
-            (
-                page_index,
-                _render_block_stream(
-                    by_page.get(page_index, []),
-                    level_rank,
-                    ext_tables=ext_tables.get(page_index),
-                ),
-            )
-        )
-    return pages
+    return parse_to_markdown_payload, render_pages
 
 
 @register_provider("warp_ingest")
 class WarpIngestProvider(Provider):
-    """Provider for Warp-Ingest (local, no API key). Apache-2.0."""
+    """Provider for Warp-Ingest (local, no API key)."""
 
     def __init__(self, provider_name: str, base_config: dict[str, Any] | None = None):
         super().__init__(provider_name, base_config)
+        configured_parse_options = self.base_config.get("parse_options")
+        if configured_parse_options is None:
+            configured_parse_options = {}
+        if not isinstance(configured_parse_options, dict):
+            raise ProviderConfigError("warp_ingest parse_options must be a dictionary")
+        self._parse_options = {**_DEFAULT_PARSE_OPTIONS, **configured_parse_options}
+        self._include_native_tables = bool(self.base_config.get("include_native_tables", True))
 
     def run_inference(self, pipeline: PipelineSpec, request: InferenceRequest) -> RawInferenceResult:
         if request.product_type != ProductType.PARSE:
@@ -402,14 +69,15 @@ class WarpIngestProvider(Provider):
         if not pdf_path.exists():
             raise ProviderPermanentError(f"PDF file not found: {pdf_path}")
 
-        try:
-            from warp_ingest.ingestor.pdf_ingestor import PDFIngestor  # noqa: F401
-        except ImportError as exc:
-            raise ProviderConfigError("warp-ingest not installed. Run: pip install warp-ingest") from exc
+        parse_to_markdown_payload = _load_markdown_exporter()[0]
 
         started_at = datetime.now()
         try:
-            raw_output = _extract_warp_blocks(pdf_path)
+            raw_output = parse_to_markdown_payload(
+                str(pdf_path),
+                parse_options=self._parse_options,
+                include_native_tables=self._include_native_tables,
+            )
         except Exception as exc:
             raise ProviderPermanentError(f"Warp-Ingest parse error: {exc}") from exc
         completed_at = datetime.now()
@@ -429,7 +97,13 @@ class WarpIngestProvider(Provider):
         if raw_result.product_type != ProductType.PARSE:
             raise ProviderPermanentError(f"WarpIngestProvider only supports PARSE, got {raw_result.product_type}")
 
-        rendered = _render_pages(raw_result.raw_output)
+        render_pages = _load_markdown_exporter()[1]
+
+        try:
+            rendered = render_pages(raw_result.raw_output)
+        except Exception as exc:
+            raise ProviderPermanentError(f"Warp-Ingest normalize error: {exc}") from exc
+
         pages = [PageIR(page_index=page_index, markdown=markdown) for page_index, markdown in rendered]
         full_text = "\n\n".join(markdown for _, markdown in rendered)
 
